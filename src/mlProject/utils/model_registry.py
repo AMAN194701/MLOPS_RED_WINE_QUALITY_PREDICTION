@@ -54,6 +54,32 @@ def register_model(
     """Register a model version and enforce quality gates."""
     registry = load_registry(registry_path)
 
+    if not metrics:
+        logger.warning(
+            f"Model {version_id} registered with empty metrics — "
+            "skipping quality gate, setting status to 'pending'"
+        )
+        entry = {
+            "id": version_id,
+            "path": str(model_path),
+            "metrics": metrics,
+            "params": params,
+            "date": datetime.now(timezone.utc).isoformat(),
+            "data_hash": data_hash or "",
+            "status": "pending",
+        }
+        registry["versions"].insert(0, entry)
+        if len(registry["versions"]) > max_versions_to_keep:
+            registry["versions"] = registry["versions"][:max_versions_to_keep]
+        save_registry(registry_path, registry)
+        return entry
+
+    if "rmse" not in metrics:
+        raise ValueError(
+            f"Cannot register model {version_id}: metrics dict must contain 'rmse' key. "
+            f"Got keys: {list(metrics.keys())}"
+        )
+
     current_production = registry.get("production")
     previous_metrics = None
     if current_production:
@@ -63,7 +89,7 @@ def register_model(
                 break
 
     status = "staging"
-    if previous_metrics and "rmse" in previous_metrics and "rmse" in metrics:
+    if previous_metrics and "rmse" in previous_metrics:
         prev_rmse = previous_metrics["rmse"]
         new_rmse = metrics["rmse"]
         if prev_rmse > 0:
@@ -84,6 +110,7 @@ def register_model(
         else:
             status = "production"
             registry["production"] = version_id
+            logger.info(f"Model {version_id} registered as production (previous RMSE was 0)")
     else:
         status = "production"
         registry["production"] = version_id

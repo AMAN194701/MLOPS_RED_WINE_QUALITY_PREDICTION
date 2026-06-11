@@ -1,3 +1,4 @@
+import json
 import pandas as pd
 import os
 from mlProject import logger
@@ -7,8 +8,9 @@ import joblib
 from pathlib import Path
 from mlProject.entity.config_entity import ModelTrainerConfig
 from mlProject.utils.model_registry import (
-    get_version_id, compute_file_hash, register_model,
+    get_version_id, compute_file_hash,
 )
+
 
 class ModelTrainer:
     def __init__(self, config: ModelTrainerConfig):
@@ -95,21 +97,18 @@ class ModelTrainer:
             "l1_ratio": self.config.l1_ratio,
         }
 
-        registry_path = Path(self.config.root_dir).parent / "model_registry.json"
-        try:
-            register_model(
-                registry_path=registry_path,
-                model_path=model_path,
-                version_id=version_id,
-                metrics={},
-                params=params,
-                data_hash=data_hash,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to register model in registry: {e}")
-
         stable_path = os.path.join(self.config.root_dir, self.config.model_name)
         joblib.dump(unified_pipeline, stable_path)
+
+        model_info = {
+            "version_id": version_id,
+            "model_path": str(model_path),
+            "params": params,
+            "data_hash": data_hash or "",
+        }
+        model_info_path = os.path.join(self.config.root_dir, "model_info.json")
+        with open(model_info_path, "w") as f:
+            json.dump(model_info, f, indent=2)
 
         logger.info(f"Unified pipeline (preprocessor + model) {version_id} trained and saved to {stable_path}")
         logger.info(f"Train X shape: {train_x.shape}, Test X shape: {test_x.shape}")
