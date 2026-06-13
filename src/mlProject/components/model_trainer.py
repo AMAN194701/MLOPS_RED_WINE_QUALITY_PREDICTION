@@ -8,7 +8,7 @@ import joblib
 from pathlib import Path
 from mlProject.entity.config_entity import ModelTrainerConfig
 from mlProject.utils.model_registry import (
-    get_version_id, compute_file_hash, register_model,
+    get_version_id, compute_file_hash,
 )
 from mlProject.components.data_transformation import NUMERIC_FEATURES
 
@@ -114,20 +114,6 @@ class ModelTrainer:
             "l1_ratio": self.config.l1_ratio,
         }
 
-        registry_path = Path(self.config.root_dir).parent / "model_registry.json"
-        try:
-            register_model(
-                registry_path=registry_path,
-                model_path=model_path,
-                version_id=version_id,
-                metrics={},
-                params=params,
-                data_hash=data_hash,
-            )
-        except ValueError as e:
-            logger.error(f"Model registry rejected version {version_id}: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to register model in registry: {e}")
         stable_path = os.path.join(self.config.root_dir, self.config.model_name)
         joblib.dump(unified_pipeline, stable_path)
 
