@@ -123,6 +123,9 @@ class ModelTrainer:
             stable_tmp_path = tmp.name
             joblib.dump(unified_pipeline, stable_tmp_path)
         os.replace(stable_tmp_path, stable_path)
+        stable_checksum_path = Path(stable_path + ".sha256")
+        from mlProject.utils.common import save_checksum
+        save_checksum(Path(stable_path), stable_checksum_path)
 
         model_info = {
             "version_id": version_id,
