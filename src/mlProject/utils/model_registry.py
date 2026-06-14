@@ -2,12 +2,38 @@ import json
 import os
 import hashlib
 import shutil
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
+import portalocker
+
 from mlProject import logger
+
+
+# Registry version stamp for optimistic concurrency
+_REGISTRY_VERSION_KEY = "_version_stamp"
+
+
+def _next_version_stamp() -> str:
+    return datetime.now(timezone.utc).isoformat() + ":" + uuid.uuid4().hex[:8]
+
+
+def _lock_registry(registry_path: Path):
+    """Acquire an exclusive lock on the registry file."""
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = registry_path.with_suffix(registry_path.suffix + ".lock")
+    lock_file = open(lock_path, "w")
+    portalocker.lock(lock_file, portalocker.LOCK_EX)
+    return lock_file
+
+
+def _unlock_registry(lock_file):
+    """Release the registry lock."""
+    portalocker.unlock(lock_file)
+    lock_file.close()
 
 
 def compute_file_hash(filepath: Path) -> str:
@@ -31,10 +57,24 @@ def load_registry(registry_path: Path) -> dict:
 
 
 def save_registry(registry_path: Path, registry: dict):
-    """Save model registry to JSON file."""
+    """Atomically save model registry to JSON file under a file lock."""
     registry_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(registry_path, "w") as f:
-        json.dump(registry, f, indent=2)
+    # Stamp with a version for optimistic concurrency detection
+    registry[_REGISTRY_VERSION_KEY] = _next_version_stamp()
+    # Atomic write: write to temp file, then replace atomically
+    fd, tmp_path = tempfile.mkstemp(
+        dir=registry_path.parent,
+        suffix=".tmp",
+        prefix=registry_path.stem + "_",
+    )
+    try:
+        with os.fdopen(fd, "w") as tmp:
+            json.dump(registry, tmp, indent=2)
+        os.replace(tmp_path, str(registry_path))
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
     logger.info(f"Model registry saved to {registry_path}")
 
 
@@ -56,17 +96,76 @@ def register_model(
     quality_gate_max_rmse_degradation_pct: float = 5.0,
 ) -> dict:
     """Register a model version and enforce quality gates."""
-    registry = load_registry(registry_path)
+    lock = _lock_registry(registry_path)
+    try:
+        registry = load_registry(registry_path)
 
-    for v in registry.get("versions", []):
-        if v.get("id") == version_id:
-            raise ValueError(f"Version ID {version_id} already exists in registry")
+        for v in registry.get("versions", []):
+            if v.get("id") == version_id:
+                raise ValueError(f"Version ID {version_id} already exists in registry")
 
-    if not metrics:
-        logger.warning(
-            f"Model {version_id} registered with empty metrics — "
-            "skipping quality gate, setting status to 'pending'"
-        )
+        if not metrics:
+            logger.warning(
+                f"Model {version_id} registered with empty metrics — "
+                "skipping quality gate, setting status to 'pending'"
+            )
+            entry = {
+                "id": version_id,
+                "path": str(model_path),
+                "metrics": metrics,
+                "params": params,
+                "date": datetime.now(timezone.utc).isoformat(),
+                "data_hash": data_hash or "",
+                "status": "pending",
+            }
+            registry["versions"].insert(0, entry)
+            if len(registry["versions"]) > max_versions_to_keep:
+                registry["versions"] = registry["versions"][:max_versions_to_keep]
+            save_registry(registry_path, registry)
+            return entry
+
+        if "rmse" not in metrics:
+            raise ValueError(
+                f"Cannot register model {version_id}: metrics dict must contain 'rmse' key. "
+                f"Got keys: {list(metrics.keys())}"
+            )
+
+        current_production = registry.get("production")
+        previous_metrics = None
+        if current_production:
+            for v in registry.get("versions", []):
+                if v.get("id") == current_production:
+                    previous_metrics = v.get("metrics", {})
+                    break
+
+        status = "staging"
+        if previous_metrics and "rmse" in previous_metrics:
+            prev_rmse = previous_metrics["rmse"]
+            new_rmse = metrics["rmse"]
+            if prev_rmse > 0:
+                degradation_pct = ((new_rmse - prev_rmse) / prev_rmse) * 100
+                if degradation_pct > quality_gate_max_rmse_degradation_pct:
+                    status = "rejected"
+                    logger.warning(
+                        f"Model {version_id} REJECTED: RMSE degradation {degradation_pct:.2f}% "
+                        f"exceeds threshold {quality_gate_max_rmse_degradation_pct}%"
+                    )
+                else:
+                    status = "production"
+                    registry["production"] = version_id
+                    logger.info(
+                        f"Model {version_id} PROMOTED to production: "
+                        f"RMSE degradation {degradation_pct:.2f}% within threshold"
+                    )
+            else:
+                status = "production"
+                registry["production"] = version_id
+                logger.info(f"Model {version_id} registered as production (previous RMSE was 0)")
+        else:
+            status = "production"
+            registry["production"] = version_id
+            logger.info(f"First model {version_id} registered as production")
+
         entry = {
             "id": version_id,
             "path": str(model_path),
@@ -74,83 +173,28 @@ def register_model(
             "params": params,
             "date": datetime.now(timezone.utc).isoformat(),
             "data_hash": data_hash or "",
-            "status": "pending",
+            "status": status,
         }
+
         registry["versions"].insert(0, entry)
+
         if len(registry["versions"]) > max_versions_to_keep:
+            archived = registry["versions"][max_versions_to_keep:]
             registry["versions"] = registry["versions"][:max_versions_to_keep]
+            for v in archived:
+                archived_path = Path(v["path"])
+                if archived_path.exists():
+                    archived_path.unlink()
+                    logger.info(f"Deleted archived model file: {archived_path}")
+                sha_path = Path(str(archived_path) + ".sha256")
+                if sha_path.exists():
+                    sha_path.unlink()
+                    logger.info(f"Deleted archived checksum: {sha_path}")
+
         save_registry(registry_path, registry)
         return entry
-
-    if "rmse" not in metrics:
-        raise ValueError(
-            f"Cannot register model {version_id}: metrics dict must contain 'rmse' key. "
-            f"Got keys: {list(metrics.keys())}"
-        )
-
-    current_production = registry.get("production")
-    previous_metrics = None
-    if current_production:
-        for v in registry.get("versions", []):
-            if v.get("id") == current_production:
-                previous_metrics = v.get("metrics", {})
-                break
-
-    status = "staging"
-    if previous_metrics and "rmse" in previous_metrics:
-        prev_rmse = previous_metrics["rmse"]
-        new_rmse = metrics["rmse"]
-        if prev_rmse > 0:
-            degradation_pct = ((new_rmse - prev_rmse) / prev_rmse) * 100
-            if degradation_pct > quality_gate_max_rmse_degradation_pct:
-                status = "rejected"
-                logger.warning(
-                    f"Model {version_id} REJECTED: RMSE degradation {degradation_pct:.2f}% "
-                    f"exceeds threshold {quality_gate_max_rmse_degradation_pct}%"
-                )
-            else:
-                status = "production"
-                registry["production"] = version_id
-                logger.info(
-                    f"Model {version_id} PROMOTED to production: "
-                    f"RMSE degradation {degradation_pct:.2f}% within threshold"
-                )
-        else:
-            status = "production"
-            registry["production"] = version_id
-            logger.info(f"Model {version_id} registered as production (previous RMSE was 0)")
-    else:
-        status = "production"
-        registry["production"] = version_id
-        logger.info(f"First model {version_id} registered as production")
-
-    entry = {
-        "id": version_id,
-        "path": str(model_path),
-        "metrics": metrics,
-        "params": params,
-        "date": datetime.now(timezone.utc).isoformat(),
-        "data_hash": data_hash or "",
-        "status": status,
-    }
-
-    registry["versions"].insert(0, entry)
-
-    if len(registry["versions"]) > max_versions_to_keep:
-        archived = registry["versions"][max_versions_to_keep:]
-        registry["versions"] = registry["versions"][:max_versions_to_keep]
-        for v in archived:
-            archived_path = Path(v["path"])
-            if archived_path.exists():
-                archived_path.unlink()
-                logger.info(f"Deleted archived model file: {archived_path}")
-            sha_path = Path(str(archived_path) + ".sha256")
-            if sha_path.exists():
-                sha_path.unlink()
-                logger.info(f"Deleted archived checksum: {sha_path}")
-
-    save_registry(registry_path, registry)
-    return entry
+    finally:
+        _unlock_registry(lock)
 
 
 def update_registration(
@@ -159,22 +203,38 @@ def update_registration(
     metrics: dict = None,
     status: str = None,
     model_path: Path = None,
+    params: dict = None,
+    data_hash: str = None,
+    quality_gate_max_rmse_degradation_pct: float = None,
 ) -> bool:
-    """Update an existing registry entry's metrics, status, and/or model path."""
-    registry = load_registry(registry_path)
-    for v in registry.get("versions", []):
-        if v.get("id") == version_id:
-            if metrics is not None:
-                v["metrics"] = metrics
-            if status is not None:
-                v["status"] = status
-            if model_path is not None:
-                v["path"] = str(model_path)
-            v["updated_at"] = datetime.now(timezone.utc).isoformat()
-            save_registry(registry_path, registry)
-            logger.info(f"Updated registration for version {version_id}: metrics={metrics is not None}, status={status}")
-            return True
-    return False
+    """Update an existing registry entry's metrics, status, model path, params, and/or data hash."""
+    lock = _lock_registry(registry_path)
+    try:
+        registry = load_registry(registry_path)
+        for v in registry.get("versions", []):
+            if v.get("id") == version_id:
+                if metrics is not None:
+                    v["metrics"] = metrics
+                if status is not None:
+                    v["status"] = status
+                if model_path is not None:
+                    v["path"] = str(model_path)
+                if params is not None:
+                    v["params"] = params
+                if data_hash is not None:
+                    v["data_hash"] = data_hash
+                if quality_gate_max_rmse_degradation_pct is not None:
+                    v["quality_gate_max_rmse_degradation_pct"] = quality_gate_max_rmse_degradation_pct
+                v["updated_at"] = datetime.now(timezone.utc).isoformat()
+                save_registry(registry_path, registry)
+                logger.info(
+                    f"Updated registration for version {version_id}: "
+                    f"metrics={metrics is not None}, status={status}"
+                )
+                return True
+        return False
+    finally:
+        _unlock_registry(lock)
 
 
 def get_production_model_path(registry_path: Path) -> Optional[Path]:
@@ -201,27 +261,34 @@ def get_staging_model_path(registry_path: Path) -> Optional[Path]:
 
 def rollback_to_version(registry_path: Path, version_id: str) -> bool:
     """Rollback production alias to a specific version and restore the model file."""
-    registry = load_registry(registry_path)
-    for v in registry.get("versions", []):
-        if v.get("id") == version_id:
-            versioned_path = Path(v["path"])
-            if not versioned_path.exists():
-                logger.error(
-                    f"Cannot rollback to version {version_id}: "
-                    f"model file not found at {versioned_path}"
+    from mlProject.utils.common import save_checksum
+    lock = _lock_registry(registry_path)
+    try:
+        registry = load_registry(registry_path)
+        for v in registry.get("versions", []):
+            if v.get("id") == version_id:
+                versioned_path = Path(v["path"])
+                if not versioned_path.exists():
+                    logger.error(
+                        f"Cannot rollback to version {version_id}: "
+                        f"model file not found at {versioned_path}"
+                    )
+                    return False
+                stable_path = versioned_path.parent / "model.joblib"
+                shutil.copy2(str(versioned_path), str(stable_path))
+                checksum_path = Path(str(stable_path) + ".sha256")
+                save_checksum(stable_path, checksum_path)
+                registry["production"] = version_id
+                save_registry(registry_path, registry)
+                logger.info(
+                    f"Rolled back production to version {version_id}, "
+                    f"restored model from {versioned_path} to {stable_path}"
                 )
-                return False
-            stable_path = versioned_path.parent / "model.joblib"
-            shutil.copy2(str(versioned_path), str(stable_path))
-            registry["production"] = version_id
-            save_registry(registry_path, registry)
-            logger.info(
-                f"Rolled back production to version {version_id}, "
-                f"restored model from {versioned_path} to {stable_path}"
-            )
-            return True
-    logger.error(f"Version {version_id} not found in registry")
-    return False
+                return True
+        logger.error(f"Version {version_id} not found in registry")
+        return False
+    finally:
+        _unlock_registry(lock)
 
 
 def validate_registry(registry_path: Path) -> List[str]:
