@@ -58,9 +58,8 @@ class PredictionPipeline:
         # Unified pipeline handles preprocessing (if available) and prediction
         try:
             prediction = self.unified_pipeline.predict(input_data)
-        except TypeError as e:
-            # If unified_pipeline is just a model without preprocessor
-            logger.warning(f"Pipeline prediction failed: {e}. Attempting direct model prediction.")
-            prediction = self.unified_pipeline.predict(input_data)
+        except Exception as e:
+            logger.error(f"Prediction failed: {e}")
+            raise RuntimeError(f"Model prediction failed: {e}") from e
         
         return prediction
